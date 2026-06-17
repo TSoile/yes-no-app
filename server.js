@@ -2,6 +2,7 @@ import express from 'express';
 import webpush from 'web-push';
 import cron from 'node-cron';
 import crypto from 'crypto';
+import { createClient } from 'redis';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -17,28 +18,18 @@ webpush.setVapidDetails(
   process.env.VAPID_PRIVATE_KEY
 );
 
-// ── Upstash Redis (REST API — no SDK needed) ──────────────
-async function redis(command, ...args) {
-  const res = await fetch(process.env.UPSTASH_REDIS_REST_URL, {
-    method:  'POST',
-    headers: {
-      Authorization:  `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify([command, ...args]),
-  });
-  const { result } = await res.json();
-  return result;
-}
+// ── Railway Redis ─────────────────────────────────────────
+const db = createClient({ url: process.env.REDIS_URL });
+db.on('error', err => console.error('Redis error:', err));
+await db.connect();
 
 async function redisGet(key) {
-  const raw = await redis('GET', key);
+  const raw = await db.get(key);
   return raw ? JSON.parse(raw) : null;
 }
 async function redisSet(key, value, exSeconds) {
-  const args = ['SET', key, JSON.stringify(value)];
-  if (exSeconds) args.push('EX', exSeconds);
-  return redis(...args);
+  const opts = exSeconds ? { EX: exSeconds } : {};
+  await db.set(key, JSON.stringify(value), opts);
 }
 
 // ── API: return VAPID public key to browser ───────────────
@@ -58,14 +49,14 @@ app.post('/api/subscribe', async (req, res) => {
     .slice(0, 16);
 
   await redisSet(`sub:${id}`, { subscription, questions: questions || [], timezoneOffset: timezoneOffset ?? 0 });
-  await redis('SADD', 'subs', id);
+  await db.sAdd('subs', id);
 
   return res.json({ ok: true });
 });
 
 // ── Cron: runs every minute, sends due notifications ──────
 async function sendDueNotifications() {
-  const ids = await redis('SMEMBERS', 'subs');
+  const ids = await db.sMembers('subs');
   if (!ids?.length) return;
 
   const now = new Date();
@@ -86,7 +77,7 @@ async function sendDueNotifications() {
 
       // Skip if already sent today
       const sentKey = `sent:${id}:${q.id}:${localDate}`;
-      const already = await redis('GET', sentKey);
+      const already = await db.get(sentKey);
       if (already) continue;
 
       try {
@@ -106,13 +97,13 @@ async function sendDueNotifications() {
           })
         );
         // Mark sent — expires in 25h to handle DST edge cases
-        await redis('SET', sentKey, '1', 'EX', 90000);
+        await db.set(sentKey, '1', { EX: 90000 });
         console.log(`Sent "${q.text}" to ${id}`);
       } catch (err) {
         if (err.statusCode === 410 || err.statusCode === 404) {
           // Subscription expired — clean it up
-          await redis('DEL', `sub:${id}`);
-          await redis('SREM', 'subs', id);
+          await db.del(`sub:${id}`);
+          await db.sRem('subs', id);
         }
         console.error(`Push failed for ${id}:`, err.message);
       }

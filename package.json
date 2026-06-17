@@ -9,6 +9,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "node-cron": "^3.0.3",
+    "redis": "^4.7.0",
     "web-push": "^3.6.7"
   }
 }
